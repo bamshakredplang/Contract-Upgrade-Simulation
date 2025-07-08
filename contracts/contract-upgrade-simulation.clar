@@ -4,6 +4,8 @@
 (define-constant ERR_UPGRADE_FAILED (err u102))
 (define-constant ERR_STORAGE_COLLISION (err u103))
 (define-constant ERR_INVALID_SELECTOR (err u104))
+(define-constant ERR_NO_ROLLBACK_AVAILABLE (err u105))
+(define-constant ERR_ROLLBACK_WINDOW_EXPIRED (err u106))
 
 (define-data-var implementation-address principal CONTRACT_OWNER)
 (define-data-var admin principal CONTRACT_OWNER)
@@ -19,6 +21,10 @@
 (define-data-var proxy-initialized bool false)
 (define-data-var total-upgrades uint u0)
 (define-data-var emergency-pause bool false)
+(define-data-var rollback-window uint u172800)
+
+(define-map implementation-history uint {impl: principal, timestamp: uint})
+(define-data-var rollback-history-count uint u0)
 
 (define-read-only (get-implementation)
   (var-get implementation-address))
@@ -51,8 +57,15 @@
     initialized: (var-get proxy-initialized),
     total-upgrades: (var-get total-upgrades),
     emergency-pause: (var-get emergency-pause),
-    upgrade-delay: (var-get upgrade-delay)
+    upgrade-delay: (var-get upgrade-delay),
+    rollback-window: (var-get rollback-window)
   })
+
+(define-read-only (get-rollback-history (index uint))
+  (map-get? implementation-history index))
+
+(define-read-only (get-rollback-history-count)
+  (var-get rollback-history-count))
 
 (define-public (initialize-proxy (initial-implementation principal))
   (begin
@@ -85,7 +98,11 @@
     (asserts! (is-some pending-impl) ERR_INVALID_IMPLEMENTATION)
     (asserts! (is-some upgrade-time) ERR_UPGRADE_FAILED)
     (asserts! (>= stacks-block-height (unwrap-panic upgrade-time)) ERR_UPGRADE_FAILED)
-    (let ((new-impl (unwrap-panic pending-impl)))
+    (let ((new-impl (unwrap-panic pending-impl))
+          (current-impl (var-get implementation-address)))
+      (map-set implementation-history (var-get rollback-history-count) 
+               {impl: current-impl, timestamp: stacks-block-height})
+      (var-set rollback-history-count (+ (var-get rollback-history-count) u1))
       (var-set implementation-address new-impl)
       (var-set pending-implementation none)
       (var-set upgrade-timestamp none)
@@ -208,3 +225,38 @@
       call-count: (get-storage-slot u999),
       stacks-block-height: stacks-block-height
     })))
+
+(define-public (rollback-implementation (history-index uint))
+  (let ((history-entry (map-get? implementation-history history-index)))
+    (asserts! (var-get proxy-initialized) ERR_UNAUTHORIZED)
+    (asserts! (not (var-get emergency-pause)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq tx-sender (var-get admin)) ERR_UNAUTHORIZED)
+    (asserts! (is-some history-entry) ERR_NO_ROLLBACK_AVAILABLE)
+    (let ((entry (unwrap-panic history-entry)))
+      (asserts! (< (- stacks-block-height (get timestamp entry)) (var-get rollback-window)) ERR_ROLLBACK_WINDOW_EXPIRED)
+      (var-set implementation-address (get impl entry))
+      (var-set total-upgrades (+ (var-get total-upgrades) u1))
+      (ok true))))
+
+(define-public (set-rollback-window (new-window uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR_UNAUTHORIZED)
+    (asserts! (>= new-window u3600) ERR_UNAUTHORIZED)
+    (var-set rollback-window new-window)
+    (ok true)))
+
+(define-public (emergency-rollback)
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR_UNAUTHORIZED)
+    (asserts! (var-get proxy-initialized) ERR_UNAUTHORIZED)
+    (asserts! (> (var-get rollback-history-count) u0) ERR_NO_ROLLBACK_AVAILABLE)
+    (let ((last-index (- (var-get rollback-history-count) u1)))
+      (let ((history-entry (map-get? implementation-history last-index)))
+        (asserts! (is-some history-entry) ERR_NO_ROLLBACK_AVAILABLE)
+        (let ((entry (unwrap-panic history-entry)))
+          (var-set implementation-address (get impl entry))
+          (var-set total-upgrades (+ (var-get total-upgrades) u1))
+          (ok true))))))
+
+
+
