@@ -6,6 +6,10 @@
 (define-constant ERR_INVALID_SELECTOR (err u104))
 (define-constant ERR_NO_ROLLBACK_AVAILABLE (err u105))
 (define-constant ERR_ROLLBACK_WINDOW_EXPIRED (err u106))
+(define-constant ERR_PROPOSAL_NOT_FOUND (err u107))
+(define-constant ERR_ALREADY_SIGNED (err u108))
+(define-constant ERR_INSUFFICIENT_SIGNATURES (err u109))
+(define-constant ERR_PROPOSAL_EXPIRED (err u110))
 
 (define-data-var implementation-address principal CONTRACT_OWNER)
 (define-data-var admin principal CONTRACT_OWNER)
@@ -25,6 +29,24 @@
 
 (define-map implementation-history uint {impl: principal, timestamp: uint})
 (define-data-var rollback-history-count uint u0)
+
+(define-data-var multisig-threshold uint u2)
+(define-data-var proposal-expiry-time uint u1440)
+(define-data-var proposal-counter uint u0)
+
+(define-map multisig-signers principal bool)
+(define-map governance-proposals uint {
+  proposal-type: (string-ascii 32),
+  proposer: principal,
+  target: (optional principal),
+  value: (optional uint),
+  data: (optional (buff 256)),
+  created-at: uint,
+  expires-at: uint,
+  executed: bool,
+  signatures-count: uint
+})
+(define-map proposal-signatures {proposal-id: uint, signer: principal} bool)
 
 (define-read-only (get-implementation)
   (var-get implementation-address))
@@ -66,6 +88,21 @@
 
 (define-read-only (get-rollback-history-count)
   (var-get rollback-history-count))
+
+(define-read-only (is-multisig-signer (signer principal))
+  (default-to false (map-get? multisig-signers signer)))
+
+(define-read-only (get-multisig-threshold)
+  (var-get multisig-threshold))
+
+(define-read-only (get-proposal (proposal-id uint))
+  (map-get? governance-proposals proposal-id))
+
+(define-read-only (has-signed-proposal (proposal-id uint) (signer principal))
+  (default-to false (map-get? proposal-signatures {proposal-id: proposal-id, signer: signer})))
+
+(define-read-only (get-proposal-counter)
+  (var-get proposal-counter))
 
 (define-public (initialize-proxy (initial-implementation principal))
   (begin
@@ -258,5 +295,58 @@
           (var-set total-upgrades (+ (var-get total-upgrades) u1))
           (ok true))))))
 
+(define-public (set-multisig-signer (signer principal) (authorized bool))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR_UNAUTHORIZED)
+    (if authorized
+      (map-set multisig-signers signer true)
+      (map-delete multisig-signers signer))
+    (ok true)))
 
+(define-public (set-multisig-threshold (new-threshold uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR_UNAUTHORIZED)
+    (asserts! (> new-threshold u0) ERR_UNAUTHORIZED)
+    (var-set multisig-threshold new-threshold)
+    (ok true)))
 
+(define-public (create-proposal (proposal-type (string-ascii 32)) (target (optional principal)) (value (optional uint)) (data (optional (buff 256))))
+  (let ((proposal-id (var-get proposal-counter)))
+    (asserts! (is-multisig-signer tx-sender) ERR_UNAUTHORIZED)
+    (map-set governance-proposals proposal-id {
+      proposal-type: proposal-type,
+      proposer: tx-sender,
+      target: target,
+      value: value,
+      data: data,
+      created-at: stacks-block-height,
+      expires-at: (+ stacks-block-height (var-get proposal-expiry-time)),
+      executed: false,
+      signatures-count: u0
+    })
+    (var-set proposal-counter (+ proposal-id u1))
+    (ok proposal-id)))
+
+(define-public (sign-proposal (proposal-id uint))
+  (let ((proposal (map-get? governance-proposals proposal-id)))
+    (asserts! (is-multisig-signer tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (is-some proposal) ERR_PROPOSAL_NOT_FOUND)
+    (asserts! (not (has-signed-proposal proposal-id tx-sender)) ERR_ALREADY_SIGNED)
+    (let ((proposal-data (unwrap-panic proposal)))
+      (asserts! (< stacks-block-height (get expires-at proposal-data)) ERR_PROPOSAL_EXPIRED)
+      (asserts! (not (get executed proposal-data)) ERR_PROPOSAL_EXPIRED)
+      (map-set proposal-signatures {proposal-id: proposal-id, signer: tx-sender} true)
+      (map-set governance-proposals proposal-id 
+               (merge proposal-data {signatures-count: (+ (get signatures-count proposal-data) u1)}))
+      (ok true))))
+
+(define-public (execute-multisig-proposal (proposal-id uint))
+  (let ((proposal (map-get? governance-proposals proposal-id)))
+    (asserts! (is-multisig-signer tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (is-some proposal) ERR_PROPOSAL_NOT_FOUND)
+    (let ((proposal-data (unwrap-panic proposal)))
+      (asserts! (< stacks-block-height (get expires-at proposal-data)) ERR_PROPOSAL_EXPIRED)
+      (asserts! (not (get executed proposal-data)) ERR_PROPOSAL_EXPIRED)
+      (asserts! (>= (get signatures-count proposal-data) (var-get multisig-threshold)) ERR_INSUFFICIENT_SIGNATURES)
+      (map-set governance-proposals proposal-id (merge proposal-data {executed: true}))
+      (ok true))))
