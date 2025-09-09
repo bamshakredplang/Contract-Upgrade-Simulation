@@ -48,6 +48,18 @@
 })
 (define-map proposal-signatures {proposal-id: uint, signer: principal} bool)
 
+(define-data-var event-counter uint u0)
+(define-map contract-events uint {
+  event-type: (string-ascii 32),
+  actor: principal,
+  timestamp: uint,
+  block-height: uint,
+  data1: (optional (string-ascii 64)),
+  data2: (optional principal),
+  data3: (optional uint)
+})
+(define-map event-type-counters (string-ascii 32) uint)
+
 (define-read-only (get-implementation)
   (var-get implementation-address))
 
@@ -104,6 +116,15 @@
 (define-read-only (get-proposal-counter)
   (var-get proposal-counter))
 
+(define-read-only (get-event (event-id uint))
+  (map-get? contract-events event-id))
+
+(define-read-only (get-event-counter)
+  (var-get event-counter))
+
+(define-read-only (get-event-type-count (event-type (string-ascii 32)))
+  (default-to u0 (map-get? event-type-counters event-type)))
+
 (define-public (initialize-proxy (initial-implementation principal))
   (begin
     (asserts! (not (var-get proxy-initialized)) ERR_UNAUTHORIZED)
@@ -112,6 +133,7 @@
     (var-set proxy-initialized true)
     (map-set implementation-versions initial-implementation u1)
     (map-set authorized-upgraders CONTRACT_OWNER true)
+    (emit-event "proxy-initialized" none (some initial-implementation) none)
     (ok true)))
 
 (define-public (propose-upgrade (new-implementation principal))
@@ -123,6 +145,7 @@
     (asserts! (not (is-eq new-implementation (var-get implementation-address))) ERR_INVALID_IMPLEMENTATION)
     (var-set pending-implementation (some new-implementation))
     (var-set upgrade-timestamp (some (+ stacks-block-height (var-get upgrade-delay))))
+    (emit-event "upgrade-proposed" none (some new-implementation) (some (var-get upgrade-delay)))
     (ok true)))
 
 (define-public (execute-upgrade)
@@ -146,6 +169,7 @@
       (var-set total-upgrades (+ (var-get total-upgrades) u1))
       (map-set implementation-versions new-impl 
                (+ (get-implementation-version new-impl) u1))
+      (emit-event "upgrade-executed" none (some new-impl) (some (var-get total-upgrades)))
       (ok true))))
 
 (define-public (cancel-upgrade)
@@ -160,6 +184,10 @@
   (begin
     (asserts! (is-eq tx-sender (var-get admin)) ERR_UNAUTHORIZED)
     (var-set emergency-pause (not (var-get emergency-pause)))
+    (emit-event "emergency-pause-toggle" 
+                (some (if (var-get emergency-pause) "paused" "unpaused")) 
+                none 
+                none)
     (ok (var-get emergency-pause))))
 
 (define-public (change-admin (new-admin principal))
@@ -273,6 +301,7 @@
       (asserts! (< (- stacks-block-height (get timestamp entry)) (var-get rollback-window)) ERR_ROLLBACK_WINDOW_EXPIRED)
       (var-set implementation-address (get impl entry))
       (var-set total-upgrades (+ (var-get total-upgrades) u1))
+      (emit-event "rollback-executed" none (some (get impl entry)) (some history-index))
       (ok true))))
 
 (define-public (set-rollback-window (new-window uint))
@@ -350,3 +379,34 @@
       (asserts! (>= (get signatures-count proposal-data) (var-get multisig-threshold)) ERR_INSUFFICIENT_SIGNATURES)
       (map-set governance-proposals proposal-id (merge proposal-data {executed: true}))
       (ok true))))
+
+(define-private (emit-event (event-type (string-ascii 32)) (data1 (optional (string-ascii 64))) (data2 (optional principal)) (data3 (optional uint)))
+  (let ((event-id (var-get event-counter)))
+    (map-set contract-events event-id {
+      event-type: event-type,
+      actor: tx-sender,
+      timestamp: (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))),
+      block-height: stacks-block-height,
+      data1: data1,
+      data2: data2,
+      data3: data3
+    })
+    (var-set event-counter (+ event-id u1))
+    (map-set event-type-counters event-type 
+             (+ (get-event-type-count event-type) u1))
+    event-id))
+
+(define-read-only (get-latest-event)
+  (if (> (var-get event-counter) u0)
+    (map-get? contract-events (- (var-get event-counter) u1))
+    none))
+
+(define-read-only (get-events-summary (start-id uint) (count uint))
+  {
+    total-events: (var-get event-counter),
+    requested-start: start-id,
+    requested-count: count,
+    available-range: (if (> (var-get event-counter) start-id) 
+                       (- (var-get event-counter) start-id) 
+                       u0)
+  })
