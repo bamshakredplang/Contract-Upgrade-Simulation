@@ -10,6 +10,7 @@
 (define-constant ERR_ALREADY_SIGNED (err u108))
 (define-constant ERR_INSUFFICIENT_SIGNATURES (err u109))
 (define-constant ERR_PROPOSAL_EXPIRED (err u110))
+(define-constant ERR_UPGRADE_RATE_LIMIT (err u111))
 
 (define-data-var implementation-address principal CONTRACT_OWNER)
 (define-data-var admin principal CONTRACT_OWNER)
@@ -59,6 +60,10 @@
   data3: (optional uint)
 })
 (define-map event-type-counters (string-ascii 32) uint)
+
+(define-data-var upgrade-cooldown-period uint u14400)
+(define-data-var last-upgrade-block uint u0)
+(define-data-var rate-limit-enabled bool true)
 
 (define-read-only (get-implementation)
   (var-get implementation-address))
@@ -116,6 +121,38 @@
 (define-read-only (get-proposal-counter)
   (var-get proposal-counter))
 
+(define-read-only (get-upgrade-cooldown-period)
+  (var-get upgrade-cooldown-period))
+
+(define-read-only (get-last-upgrade-block)
+  (var-get last-upgrade-block))
+
+(define-read-only (is-rate-limit-enabled)
+  (var-get rate-limit-enabled))
+
+(define-read-only (can-upgrade-now)
+  (or (not (var-get rate-limit-enabled))
+      (is-eq (var-get last-upgrade-block) u0)
+      (>= stacks-block-height (+ (var-get last-upgrade-block) (var-get upgrade-cooldown-period)))))
+
+(define-read-only (get-blocks-until-next-upgrade)
+  (if (or (not (var-get rate-limit-enabled)) (is-eq (var-get last-upgrade-block) u0))
+    u0
+    (let ((next-allowed-block (+ (var-get last-upgrade-block) (var-get upgrade-cooldown-period))))
+      (if (>= stacks-block-height next-allowed-block)
+        u0
+        (- next-allowed-block stacks-block-height)))))
+
+(define-read-only (get-rate-limit-status)
+  {
+    enabled: (var-get rate-limit-enabled),
+    cooldown-period: (var-get upgrade-cooldown-period),
+    last-upgrade-block: (var-get last-upgrade-block),
+    current-block: stacks-block-height,
+    can-upgrade: (can-upgrade-now),
+    blocks-remaining: (get-blocks-until-next-upgrade)
+  })
+
 (define-read-only (get-event (event-id uint))
   (map-get? contract-events event-id))
 
@@ -158,6 +195,7 @@
     (asserts! (is-some pending-impl) ERR_INVALID_IMPLEMENTATION)
     (asserts! (is-some upgrade-time) ERR_UPGRADE_FAILED)
     (asserts! (>= stacks-block-height (unwrap-panic upgrade-time)) ERR_UPGRADE_FAILED)
+    (asserts! (can-upgrade-now) ERR_UPGRADE_RATE_LIMIT)
     (let ((new-impl (unwrap-panic pending-impl))
           (current-impl (var-get implementation-address)))
       (map-set implementation-history (var-get rollback-history-count) 
@@ -167,6 +205,7 @@
       (var-set pending-implementation none)
       (var-set upgrade-timestamp none)
       (var-set total-upgrades (+ (var-get total-upgrades) u1))
+      (var-set last-upgrade-block stacks-block-height)
       (map-set implementation-versions new-impl 
                (+ (get-implementation-version new-impl) u1))
       (emit-event "upgrade-executed" none (some new-impl) (some (var-get total-upgrades)))
@@ -410,3 +449,28 @@
                        (- (var-get event-counter) start-id) 
                        u0)
   })
+
+(define-public (set-upgrade-cooldown (new-cooldown uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR_UNAUTHORIZED)
+    (asserts! (>= new-cooldown u1440) ERR_UNAUTHORIZED)
+    (var-set upgrade-cooldown-period new-cooldown)
+    (emit-event "cooldown-updated" none none (some new-cooldown))
+    (ok true)))
+
+(define-public (toggle-rate-limit (enabled bool))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR_UNAUTHORIZED)
+    (var-set rate-limit-enabled enabled)
+    (emit-event "rate-limit-toggled" 
+                (some (if enabled "enabled" "disabled")) 
+                none 
+                none)
+    (ok enabled)))
+
+(define-public (reset-rate-limit-timer)
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR_UNAUTHORIZED)
+    (var-set last-upgrade-block u0)
+    (emit-event "rate-limit-reset" none none none)
+    (ok true)))
