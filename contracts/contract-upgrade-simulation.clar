@@ -11,6 +11,10 @@
 (define-constant ERR_INSUFFICIENT_SIGNATURES (err u109))
 (define-constant ERR_PROPOSAL_EXPIRED (err u110))
 (define-constant ERR_UPGRADE_RATE_LIMIT (err u111))
+(define-constant ERR_NO_PENDING_ADMIN (err u112))
+(define-constant ERR_TRANSFER_EXPIRED (err u113))
+(define-constant ERR_NOT_PENDING_ADMIN (err u114))
+(define-constant ERR_INVALID_ADMIN (err u115))
 
 (define-data-var implementation-address principal CONTRACT_OWNER)
 (define-data-var admin principal CONTRACT_OWNER)
@@ -64,6 +68,10 @@
 (define-data-var upgrade-cooldown-period uint u14400)
 (define-data-var last-upgrade-block uint u0)
 (define-data-var rate-limit-enabled bool true)
+
+(define-data-var pending-admin (optional principal) none)
+(define-data-var admin-transfer-expiry (optional uint) none)
+(define-data-var admin-transfer-window uint u1440)
 
 (define-read-only (get-implementation)
   (var-get implementation-address))
@@ -151,6 +159,13 @@
     current-block: stacks-block-height,
     can-upgrade: (can-upgrade-now),
     blocks-remaining: (get-blocks-until-next-upgrade)
+  })
+
+(define-read-only (get-admin-transfer-status)
+  {
+    pending: (var-get pending-admin),
+    expiry: (var-get admin-transfer-expiry),
+    window: (var-get admin-transfer-window)
   })
 
 (define-read-only (get-event (event-id uint))
@@ -473,4 +488,41 @@
     (asserts! (is-eq tx-sender (var-get admin)) ERR_UNAUTHORIZED)
     (var-set last-upgrade-block u0)
     (emit-event "rate-limit-reset" none none none)
+    (ok true)))
+
+(define-public (propose-admin-transfer (new-admin principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR_UNAUTHORIZED)
+    (asserts! (not (is-eq new-admin (var-get admin))) ERR_INVALID_ADMIN)
+    (var-set pending-admin (some new-admin))
+    (var-set admin-transfer-expiry (some (+ stacks-block-height (var-get admin-transfer-window))))
+    (emit-event "admin-transfer-proposed" none (some new-admin) (some (var-get admin-transfer-window)))
+    (ok true)))
+
+(define-public (accept-admin-transfer)
+  (let ((p (var-get pending-admin))
+        (e (var-get admin-transfer-expiry)))
+    (asserts! (is-some p) ERR_NO_PENDING_ADMIN)
+    (asserts! (is-some e) ERR_NO_PENDING_ADMIN)
+    (asserts! (is-eq tx-sender (unwrap-panic p)) ERR_NOT_PENDING_ADMIN)
+    (asserts! (< stacks-block-height (unwrap-panic e)) ERR_TRANSFER_EXPIRED)
+    (var-set admin (unwrap-panic p))
+    (var-set pending-admin none)
+    (var-set admin-transfer-expiry none)
+    (emit-event "admin-transfer-accepted" none (some tx-sender) none)
+    (ok true)))
+
+(define-public (cancel-admin-transfer)
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR_UNAUTHORIZED)
+    (var-set pending-admin none)
+    (var-set admin-transfer-expiry none)
+    (emit-event "admin-transfer-canceled" none none none)
+    (ok true)))
+
+(define-public (set-admin-transfer-window (new-window uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR_UNAUTHORIZED)
+    (asserts! (>= new-window u60) ERR_UNAUTHORIZED)
+    (var-set admin-transfer-window new-window)
     (ok true)))
